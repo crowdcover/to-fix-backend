@@ -189,7 +189,7 @@ server.route({
         if (from == to) to = to + 86400;
         var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
         var query = "SELECT count(*), attributes->'user' AS user, attributes->'action' AS action FROM " + table + "_stats WHERE time < $1 AND time > $2 AND (attributes->'action'='edit' OR attributes->'action'='skip' OR attributes->'action'='fix' OR attributes->'action'='noterror') GROUP BY attributes->'user', attributes->'action' ORDER BY attributes->'user';";
-        client.query(query, [to, from], function(err, results) {
+            client.query(query, [to, from], function(err, results) {
             if (err) {
                 reply(boom.badRequest(err));
                 return false;
@@ -437,16 +437,13 @@ server.route({
     method: 'GET',
     path: '/tasks',
     handler: function(request, reply) {
-
-        queue(1)
-            .defer(function(cb) {
-                client.query('SELECT * FROM task_details;', cb);
-            })
-           
-            .awaitAll(function(err, results) {
-                if (err) return reply(boom.badRequest(err));
-                reply(results.rows);
+            
+        client.query('SELECT * FROM task_details;', function(err, results) {
+            if (err) return reply(boom.badRequest(err));
+            reply({
+                data: results.rows
             });
+        }); 
     }
 });
 
