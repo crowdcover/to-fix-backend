@@ -438,7 +438,7 @@ server.route({
     path: '/tasks',
     handler: function(request, reply) {
             
-        client.query('SELECT * FROM task_details;', function(err, results) {
+        client.query('SELECT task, hstore_to_json(attributes) as attributes FROM task_details;', function(err, results) {
             if (err) return reply(boom.badRequest(err));
             reply({
                 data: results.rows
