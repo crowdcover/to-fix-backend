@@ -440,13 +440,12 @@ server.route({
 
         queue(1)
             .defer(function(cb) {
-                // overall count
                 client.query('SELECT * FROM task_details;', cb);
             })
            
             .awaitAll(function(err, results) {
                 if (err) return reply(boom.badRequest(err));
-                reply(results);
+                reply(results.rows);
             });
     }
 });
