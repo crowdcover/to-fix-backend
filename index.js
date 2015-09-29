@@ -433,6 +433,24 @@ server.route({
     }
 });
 
+server.route({
+    method: 'GET',
+    path: '/tasks',
+    handler: function(request, reply) {
+
+        queue(1)
+            .defer(function(cb) {
+                // overall count
+                client.query('SELECT * FROM task_details;', cb);
+            })
+           
+            .awaitAll(function(err, results) {
+                if (err) return reply(boom.badRequest(err));
+                reply(results);
+            });
+    }
+});
+
 pg.connect(conString, function(err, c, d) {
     if (err) return console.log(err);
     console.log('connected to:', address);
