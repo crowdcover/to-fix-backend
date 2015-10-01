@@ -8,6 +8,9 @@ var fs = require('fs'),
     reformatCsv = require('./lib/reformat-csv'),
     queries = require('./lib/queries');
 
+var get_functions = require('./lib/get_functions');
+var post_functions = require('./lib/post_functions');
+
 var user = process.env.DBUsername || 'postgres';
 var password = process.env.DBPassword || '';
 var address = process.env.DBAddress || 'localhost';
@@ -42,11 +45,30 @@ server.connection({
     }
 });
 
+var tasks = {};
+
 server.route({
     method: 'GET',
     path: '/status',
     handler: function(request, reply) {
-        reply({status: 'a ok'});
+        pg.connect(conString, function(err, c, d) {
+            if (err) {
+                reply('error').code(500)
+            } else {
+                reply({
+                    status: 'a ok'
+                });
+            }
+            c.end();
+        });
+    }
+});
+
+server.route({
+    method: 'GET',
+    path: '/sends-errors',
+    handler: function(request, reply) {
+        reply('error').code(500)
     }
 });
 
@@ -54,59 +76,24 @@ server.route({
     method: 'POST',
     path: '/track/{task}',
     handler: function(request, reply) {
-        var table = request.params.task;
+        var table = request.params.task.simplify();
         var attributes = request.payload.attributes;
         if (!attributes) return reply(boom.badRequest('missing attributes'));
-
         // don't wait
         reply();
-        track(table, request.payload.time, attributes, function(err, results) {
+        post_functions.track(client, table, request.payload.time, attributes, function(err, results) {
             if (err) console.error('/track err', err);
         });
     }
 });
 
-function track(table, time, attributes, callback) {
-    if(typeof attributes.key !== 'undefined'){// filter undefined track after a task was complete
-        // validate time, is int, is within range
-        time = time || Math.round(+new Date()/1000);
-        table = table.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = 'INSERT INTO ' + table + '_stats VALUES($1, $2);';
-
-        client.query(query, [time, hstore.stringify(attributes)], function(err, results) {
-            if (err) return callback(err);
-            callback(null, results);
-        });
-    }
-}
 
 server.route({
     method: 'GET',
     path: '/count/{task}',
     handler: function(request, reply) {
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-
-        queue(1)
-            .defer(function(cb) {
-                // overall count
-                client.query('SELECT count(*) FROM ' + table + ';', cb);
-            })
-            .defer(function(cb) {
-                // unfixed items
-                client.query('SELECT count(*) FROM ' + table + ' WHERE time != 2147483647;', cb);
-            })
-            .defer(function(cb) {
-                // items that are active
-                client.query('SELECT count(*) from ' + table + ' WHERE time > ' + Math.round(+new Date()/1000) + ' AND time != 2147483647;' , cb);
-            })
-            .awaitAll(function(err, results) {
-                if (err) return reply(boom.badRequest(err));
-                reply({
-                    total: parseInt(results[0].rows[0].count),
-                    available: parseInt(results[1].rows[0].count),
-                    active: parseInt(results[2].rows[0].count)
-                });
-            });
+        var table = tasks[request.params.task.simplify()];
+        get_functions.count(client, request, reply, table);
     }
 });
 
@@ -114,30 +101,8 @@ server.route({
     method: 'GET',
     path: '/count_history/{task}/{grouping}',
     handler: function(request, reply) {
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = "SELECT count(*), attributes->'action' AS action, date_trunc($1, to_timestamp(time)) AS time FROM " + table + "_stats WHERE attributes->'action'='skip' OR attributes->'action'='edit' OR attributes->'action'='fix' OR attributes->'action'='noterror' GROUP BY date_trunc($1, to_timestamp(time)), attributes->'action' ORDER BY date_trunc($1, to_timestamp(time));";
-        client.query(query, [request.params.grouping], function(err, results) {
-            if (err) return reply(boom.badRequest(err));
-            var times = {};
-
-            results.rows.forEach(function(row) {
-                var time = Math.round(+new Date(row.time)/1000);
-                if (!times[time]) times[time] = {};
-                times[time][row.action] = parseInt(row.count);
-            });
-
-            var out = [];
-            for (var time in times) {
-                times[time].start = parseInt(time);
-                out.push(times[time]);
-            }
-
-            reply({
-                updated: Math.round(+new Date()/1000),
-                data: out
-            });
-
-        });
+        var table = request.params.task.simplify();
+        get_functions.count_history(client, request, reply,table);
     }
 });
 
@@ -145,37 +110,8 @@ server.route({
     method: 'GET',
     path: '/track/{task}/{key}:{value}/{to?}',
     handler: function(request, reply) {
-        // gets results filtered by key:value or by date range
-        // user:joey, filters from hstore
-        // or
-        // from:2015-03-17/to:2015-03-19, filters on time
-
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = 'SELECT time AS time, hstore_to_json_loose(attributes) AS attributes FROM ' + table + '_stats WHERE ';
-        var params;
-
-        if (request.params.key == 'from' && request.params.to) {
-            var from = Date.parse(request.params.value)/1000;
-            var to = Date.parse(request.params.to.split(':')[1])/1000;
-            // go to the end of the to date
-            to = to + 86400;
-            query += 'time > $1 and time < $2;';
-            params = [from, to];
-        } else if (request.params.key == 'from' && !request.params.to) {
-            var from = Date.parse(request.params.value)/1000;
-            query += 'time > $1;';
-            params = [from];
-        } else {
-            query += 'attributes->$1=$2 ORDER BY time ASC;';
-            params = [request.params.key, request.params.value];
-        }
-        client.query(query, params, function(err, results) {
-            if (err) return reply(boom.badRequest(err));
-            reply({
-                updated: Math.round(+new Date()/1000),
-                data: results.rows
-            });
-        });
+        var table = request.params.task.simplify();
+        get_functions.track(client, request, reply,table);
     }
 });
 
@@ -183,39 +119,8 @@ server.route({
     method: 'GET',
     path: '/track_stats/{task}/{from}/{to}',
     handler: function(request, reply) {
-        // give stats for the given time period
-        var from = Math.round(+new Date(request.params.from.split(':')[1])/1000);
-        var to = Math.round(+new Date(request.params.to.split(':')[1])/1000);
-        if (from == to) to = to + 86400;
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = "SELECT count(*), attributes->'user' AS user, attributes->'action' AS action FROM " + table + "_stats WHERE time < $1 AND time > $2 AND (attributes->'action'='edit' OR attributes->'action'='skip' OR attributes->'action'='fix' OR attributes->'action'='noterror') GROUP BY attributes->'user', attributes->'action' ORDER BY attributes->'user';";
-            client.query(query, [to, from], function(err, results) {
-            if (err) {
-                reply(boom.badRequest(err));
-                return false;
-            }
-
-            var users = {};
-            results.rows.forEach(function(row) {
-                if (row.user && row.user.trim()) {
-                    if (!users[row.user]) {
-                        users[row.user] = {};
-                    }
-                    users[row.user][row.action] = parseInt(row.count);
-                }
-            });
-
-            users = Object.keys(users).map(function(user) {
-                var out = users[user];
-                out.user = user;
-                return out;
-            });
-
-            reply({
-                updated: Math.round(+new Date()/1000),
-                stats: users
-            });
-        });
+        var table = request.params.task.simplify();
+        get_functions.track_stats(client, request, reply,table);
     }
 });
 
@@ -223,24 +128,8 @@ server.route({
     method: 'POST',
     path: '/task/{task}',
     handler: function(request, reply) {
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = 'SELECT key, value FROM task_' + table + '($1,$2)';
-        var now = Math.round(+new Date()/1000);
-        client.query(query, [lockPeriod, now], function(err, results) {            
-            if (err) return reply(boom.badRequest(err));
-            if (results.rows[0].key === 'complete') {
-               return reply(boom.resourceGone(JSON.stringify({
-                        key: results.rows[0].key,
-                        value:  JSON.parse(results.rows[0].value.split('|').join('"'))
-                        })
-                    ));
-            }else{
-                return reply(JSON.stringify({
-                    key: results.rows[0].key,
-                    value: JSON.parse(results.rows[0].value.split('|').join('"'))
-                }));
-            }
-        });
+        var table = tasks[request.params.task.simplify()];
+        post_functions.task(client, request, reply, lockPeriod, table);
     }
 });
 
@@ -253,25 +142,8 @@ server.route({
         }
     },
     handler: function(request, reply) {
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        // 2147483647 is int max
-        var query = 'UPDATE ' + table + ' SET time=2147483647 WHERE key=$1;';
-        client.query(query, [request.payload.key], function(err, results) {
-            if (err) return boom.badRequest(err);
-            // check for a real update, err if not
-            return reply('ok');
-        });
-
-        var attributes = {
-            user: request.payload.user,
-            key: request.payload.key,
-            action: 'fix'
-        };
-
-        track(table, false, attributes, function(err, results) {
-            if (err) console.error('/fixed tracking err', err);
-        });
-
+        var table = tasks[request.params.task.simplify()];
+        post_functions.fixed(client, request, reply, table);
     }
 });
 
@@ -284,21 +156,24 @@ server.route({
         }
     },
     handler: function(request, reply) {
-        var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = 'UPDATE ' + table + ' SET time=2147483647 WHERE key=$1;';
-        client.query(query, [request.payload.key], function(err, results) {
-            if (err) return boom.badRequest(err);
-            return reply('ok');
-        });
-        var attributes = {
-            user: request.payload.user,
-            key: request.payload.key,
-            action: 'noterror'
-        };
+        var table = tasks[request.params.task.simplify()];
+        post_functions.noterror(client, request, reply, table);
+    }
+});
 
-        track(table, false, attributes, function(err, results) {
-            if (err) console.error('/Not a error tracking err', err);
-        });
+server.route({
+    method: 'GET',
+    path: '/detail/{idtask}',
+    handler: function(request, reply) {
+        get_functions.detail(client, request, reply);
+    }
+});
+
+server.route({
+    method: 'GET',
+    path: '/tasks',
+    handler: function(request, reply) {
+        get_functions.tasks(client, request, reply);
     }
 });
 
@@ -313,137 +188,46 @@ server.route({
         }
     },
     handler: function(request, reply) {
-        // confirm db config vars are set
-        // err immeditately if not
-        var data = request.payload;
-
-        if (!data.file ||
-            (!data.password || data.password === '') ||
-            (!data.name || data.name === '')) return reply(boom.badRequest('missing something'));
-
-        if (data.password != uploadPassword) return reply(boom.unauthorized('invalid password'));
-
-        if (data.file) {
-            var name = data.file.hapi.filename;
-            var taskName = data.name.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-            // just looking at the extension for now
-            if (name.slice(-4) != '.csv') return reply(boom.badRequest('.csv files only'));
-            if (path[path.length-1] !== '/') path = path + '/';
-            var file = fs.createWriteStream(path + name);
-
-            file.on('error', function (err) {
-                reply(boom.badRequest(err));
-            });
-
-            data.file.pipe(file);
-
-            data.file.on('end', function (err) {
-                reformatCsv(path, path + name, function(err, filename) {
-                    if (err) {
-                        fs.unlink(path + name, function() {
-                            reply(boom.badRequest(err));
-                        });
-                    } else {
-                        var closed = 0;
-
-                        client.query('CREATE TABLE temp_' + taskName + ' (key VARCHAR(255), value TEXT);', function(err, results) {
-                            if (err) {
-                                console.log('create temp');
-                                return reply(boom.badRequest(err));
-                            }
-                        });
-
-                        var stream = client.query(pg_copy.from('COPY temp_' + taskName + ' FROM STDIN (FORMAT CSV);'));
-                        var fileStream = fs.createReadStream(filename, {encoding: 'utf8'});
-
-                        // csv errors aren't being caught and surfaced very well, silent
-
-                        fileStream
-                            .on('error', function(err) {
-                                console.log('err here', err);
-                                return reply(boom.badRequest(err));
-                            })
-                            .pipe(stream)
-                                .on('finish', theEnd)
-                                .on('error', theEnd);
-
-                        // do this because on error both will emit something and calling reply twice errors
-                        function theEnd(err) {
-                            if (err) {
-                                closed = 1;
-                                return closed ? null : reply(boom.badRequest(err));
-                            }
-                            setTimeout(function() {
-                                queue(1)
-                                    .defer(function(cb) {
-                                        var query = 'ALTER TABLE temp_' + taskName + ' ADD COLUMN time INT DEFAULT 0;';
-                                        client.query(query, cb);
-                                    })
-                                    .defer(function(cb) {
-                                        var order = ' ORDER BY RANDOM();';
-                                        if (data.preserve) order = ';';
-                                        var query = 'CREATE TABLE ' + taskName + ' as SELECT * FROM temp_' + taskName + order;
-                                        client.query(query, cb);
-                                    })
-                                    .defer(function(cb) {
-                                        var query = 'CREATE INDEX CONCURRENTLY ON ' + taskName + ' (time);';
-                                        client.query(query, cb);
-                                    })
-                                    .defer(function(cb) {
-                                        var query = 'CREATE TABLE ' + taskName + '_stats (time INT, attributes HSTORE);';
-                                        client.query(query, cb);
-                                    })
-                                    .defer(function(cb) {
-                                        var query = 'CREATE INDEX CONCURRENTLY ON ' + taskName + '_stats (time);';
-                                        client.query(query, cb);
-                                    }).defer(function(cb){
-                                        var query = queries.create_type();
-                                        client.query(query, cb);
-                                    }).defer(function(cb){
-                                        var query = queries.create_function(taskName);
-                                        client.query(query, cb);
-                                    })
-                                    .defer(function(cb) {
-                                        var query = 'DROP TABLE temp_' + taskName + ';';
-                                        client.query(query, cb);
-                                    })
-                                    .defer(function(cb) {
-                                        var details = {
-                                            title: '',
-                                            description: '',
-                                            updated: Math.round(+new Date()/1000),
-                                            owner: JSON.stringify([data.user || null])
-                                        };
-                                        client.query('INSERT INTO task_details VALUES($1, $2);', [taskName, hstore.stringify(details)], cb);
-                                    })
-                                    .awaitAll(function(err, results) {
-                                        if (err) return reply(boom.badRequest(err));
-                                        reply({
-                                            taskname: taskName
-                                        });
-                                    });
-                            }, 500);
-                        }
-
-                    }
-                });
-            });
-
-        }
+        post_functions.csv(client, request, reply, function(results) {
+            load_tasks(results.status);
+            return reply(JSON.stringify({
+                taskid: results.taskid
+            }));
+        });
     }
 });
+
+
+function load_tasks(status) {
+    if (status) {
+        tasks = {};
+        var query = 'SELECT id, tasktable FROM task_details ORDER BY status, title;';
+        var cliente = client.query(query, function(err, results) {
+            results.rows.forEach(function(row) {
+                tasks[row.id] = row.tasktable;
+            });
+        });
+        // cliente.on('end', function(result) {
+        //     console.log(tasks);
+        // });
+    }
+}
+
+String.prototype.simplify = function() {
+    return this.replace(/[^a-zA-Z]+/g, '').toLowerCase()
+};
 
 server.route({
     method: 'GET',
     path: '/tasks',
     handler: function(request, reply) {
-            
+
         client.query('SELECT task, hstore_to_json(attributes) as attributes FROM task_details;', function(err, results) {
             if (err) return reply(boom.badRequest(err));
             reply({
                 data: results.rows
             });
-        }); 
+        });
     }
 });
 
@@ -454,5 +238,6 @@ pg.connect(conString, function(err, c, d) {
     done = d;
     server.start(function() {
         console.log('server on port', port);
+        load_tasks(true)
     });
 });
